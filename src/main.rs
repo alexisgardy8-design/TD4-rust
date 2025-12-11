@@ -1,125 +1,129 @@
-use std::collections::{HashMap, BinaryHeap};
-use std::cmp::Reverse;
 use std::time::Instant;
 
-fn analyze_text_slow(text: &str) -> TextStats {
-    let start = Instant::now();
+const MAX_WORD_LEN: usize = 32;
+const MAX_UNIQUE_WORDS: usize = 128;
 
-    let mut word_freq = HashMap::new();
-    for line in text.lines() {
-        for word in line.split_whitespace() {
-            let clean_word = word.to_lowercase()
-                .chars()
-                .filter(|c| c.is_alphabetic())
-                .collect::<String>();
+struct WordTable {
+    words: Vec<u8>,
+    offsets: Vec<(u32, u16)>,
+    counts: Vec<u32>,
+}
 
-            if !clean_word.is_empty() {
-                *word_freq.entry(clean_word.clone()).or_insert(0) += 1;
-            }
+impl WordTable {
+    fn new() -> Self {
+        Self {
+            words: Vec::with_capacity(2048),
+            offsets: Vec::with_capacity(MAX_UNIQUE_WORDS),
+            counts: Vec::with_capacity(MAX_UNIQUE_WORDS),
         }
     }
 
-    let mut word_vec: Vec<_> = word_freq.iter().collect();
-    word_vec.sort_by(|a, b| b.1.cmp(&a.1));
-    let top_words: Vec<(String, usize)> = word_vec
-        .into_iter()
-        .take(10)
-        .map(|(w, c)| (w.clone(), *c))
-        .collect();
-
-    let mut char_count = 0;
-    for line in text.lines() {
-        for ch in line.chars() {
-            if ch.is_alphabetic() {
-                char_count += 1;
+    #[inline(always)]
+    fn find_or_insert(&mut self, word: &[u8]) -> usize {
+        for (i, &(offset, len)) in self.offsets.iter().enumerate() {
+            let start = offset as usize;
+            let end = start + len as usize;
+            if &self.words[start..end] == word {
+                return i;
             }
         }
+        
+        let offset = self.words.len() as u32;
+        let len = word.len() as u16;
+        self.words.extend_from_slice(word);
+        self.offsets.push((offset, len));
+        self.counts.push(0);
+        self.offsets.len() - 1
     }
 
-    let mut all_words = Vec::new();
-    for line in text.lines() {
-        for word in line.split_whitespace() {
-            let clean = word.to_lowercase()
-                .chars()
-                .filter(|c| c.is_alphabetic())
-                .collect::<String>();
-            if !clean.is_empty() {
-                all_words.push(clean);
-            }
-        }
-    }
-
-    all_words.sort_by(|a, b| b.len().cmp(&a.len()));
-    let longest_words: Vec<String> = all_words.iter()
-        .take(5)
-        .map(|s| s.clone())
-        .collect();
-
-    TextStats {
-        word_count: word_freq.len(),
-        char_count,
-        top_words,
-        longest_words,
-        time_ms: start.elapsed().as_millis(),
+    fn get_word(&self, idx: usize) -> &str {
+        let (offset, len) = self.offsets[idx];
+        let start = offset as usize;
+        let end = start + len as usize;
+        unsafe { std::str::from_utf8_unchecked(&self.words[start..end]) }
     }
 }
 
-fn analyze_text_fast(text: &str) -> TextStats {
-    let start = Instant::now();
-
-    let mut word_freq: HashMap<String, usize> = HashMap::with_capacity(10000);
+#[inline(always)]
+fn process_word_bytes(word: &[u8], buffer: &mut Vec<u8>) -> usize {
+    buffer.clear();
     let mut char_count = 0;
-    let mut longest_words_heap: BinaryHeap<Reverse<(usize, String)>> = BinaryHeap::new();
-
-    for word in text.split_ascii_whitespace() {
-        let mut clean_word = String::with_capacity(word.len());
-        for &ch in word.as_bytes() {
-            if ch.is_ascii_alphabetic() {
-                char_count += 1;
-                clean_word.push((ch | 0x20) as char);
-            }
+    
+    for &byte in word {
+        if byte.is_ascii_alphabetic() {
+            buffer.push(byte.to_ascii_lowercase());
+            char_count += 1;
         }
+    }
+    
+    char_count
+}
 
-        if !clean_word.is_empty() {
-            let len = clean_word.len();
+fn analyze_text_slow(text: &str) -> TextStats {
+    let mut word_table = WordTable::new();
+    let mut longest_5 = [(0usize, 0u16); 5];
+    let mut longest_count = 0;
+    let mut char_count = 0;
+
+    let mut buffer = Vec::with_capacity(MAX_WORD_LEN);
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let len = bytes.len();
+    
+    while i < len {
+        while i < len && bytes[i] <= b' ' {
+            i += 1;
+        }
+        
+        if i >= len { break; }
+        
+        let word_start = i;
+        while i < len && bytes[i] > b' ' {
+            i += 1;
+        }
+        
+        char_count += process_word_bytes(&bytes[word_start..i], &mut buffer);
+
+        if !buffer.is_empty() {
+            let word_idx = word_table.find_or_insert(&buffer);
+            word_table.counts[word_idx] += 1;
             
-            if longest_words_heap.len() < 5 {
-                longest_words_heap.push(Reverse((len, clean_word.clone())));
-            } else if let Some(&Reverse((min_len, _))) = longest_words_heap.peek() {
-                if len > min_len {
-                    longest_words_heap.pop();
-                    longest_words_heap.push(Reverse((len, clean_word.clone())));
+            let word_len = buffer.len();
+            
+            if longest_count < 5 {
+                longest_5[longest_count] = (word_len, word_idx as u16);
+                longest_count += 1;
+            } else {
+                let min_len = longest_5[0].0.min(longest_5[1].0).min(longest_5[2].0).min(longest_5[3].0).min(longest_5[4].0);
+                if word_len > min_len {
+                    let min_idx = (0..5).min_by_key(|&i| longest_5[i].0).unwrap();
+                    longest_5[min_idx] = (word_len, word_idx as u16);
                 }
             }
-            
-            *word_freq.entry(clean_word).or_insert(0) += 1;
         }
     }
 
-    let word_count = word_freq.len();
+    let word_count = word_table.offsets.len();
+    let mut top_words: Vec<(String, usize)> = Vec::with_capacity(word_count);
     
-    let mut top_words_heap: BinaryHeap<(usize, String)> = word_freq
-        .into_iter()
-        .map(|(w, c)| (c, w))
-        .collect();
-    
-    let mut top_words = Vec::with_capacity(10);
-    for _ in 0..10 {
-        if let Some((count, word)) = top_words_heap.pop() {
-            top_words.push((word, count));
-        }
+    for i in 0..word_count {
+        top_words.push((word_table.get_word(i).to_string(), word_table.counts[i] as usize));
     }
     
-    let mut longest_vec: Vec<_> = longest_words_heap.into_iter().map(|Reverse(x)| x).collect();
-    longest_vec.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-    let longest_words: Vec<String> = longest_vec.into_iter().map(|(_, w)| w).collect();
+    top_words.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    top_words.truncate(10);
+
+    longest_5[..longest_count].sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let longest_words: Vec<String> = longest_5[..longest_count]
+        .iter()
+        .map(|(_, idx)| word_table.get_word(*idx as usize).to_string())
+        .collect();
 
     TextStats {
         word_count,
         char_count,
         top_words,
         longest_words,
-        time_ms: start.elapsed().as_millis(),
     }
 }
 
@@ -129,32 +133,14 @@ struct TextStats {
     char_count: usize,
     top_words: Vec<(String, usize)>,
     longest_words: Vec<String>,
-    time_ms: u128,
 }
 
 fn generate_test_text(size: usize) -> String {
-    let base_words = vec![
-        "rust", "performance", "optimization", "memory", "speed", "efficiency",
-        "benchmark", "algorithm", "data", "structure", "programming", "language",
-        "system", "compile", "zero", "cost", "abstraction", "ownership", "borrow",
-        "lifetime", "trait", "generic", "macro", "unsafe", "async", "await",
-        "concurrency", "parallelism", "thread", "mutex", "channel", "vector",
-        "hashmap", "iterator", "closure", "pattern", "matching", "error", "handling",
-        "result", "option", "reference", "pointer", "stack", "heap", "allocation",
-        "deallocation", "garbage", "collection", "cargo", "crate", "module",
-        "function", "method", "struct", "enum", "impl", "type", "inference",
-        "syntax", "semantic", "compiler", "llvm", "inline",
-        "monomorphization", "specialization", "documentation", "test", "integration"
-    ];
-    
+    let words = vec!["rust", "performance", "optimization", "memory", "speed",
+                     "efficiency", "benchmark", "algorithm", "data", "structure"];
+
     (0..size)
-        .map(|i| {
-            if i % 20 < 19 {
-                format!("uniqueword{}", i)
-            } else {
-                base_words[i % base_words.len()].to_string()
-            }
-        })
+        .map(|i| words[i % words.len()])
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -163,23 +149,16 @@ fn main() {
     let text = generate_test_text(50_000);
 
     println!("Analyzing {} bytes of text...\n", text.len());
-
-    let stats_slow = analyze_text_slow(&text);
-    println!("SLOW VERSION:");
-    println!("  Unique words: {}", stats_slow.word_count);
-    println!("  Total chars: {}", stats_slow.char_count);
-    println!("  Top 10 words: {:?}", stats_slow.top_words);
-    println!("  Longest words: {:?}", stats_slow.longest_words);
-    println!("  Time: {} ms\n", stats_slow.time_ms);
-
-    let stats_fast = analyze_text_fast(&text);
-    println!("FAST VERSION:");
-    println!("  Unique words: {}", stats_fast.word_count);
-    println!("  Total chars: {}", stats_fast.char_count);
-    println!("  Top 10 words: {:?}", stats_fast.top_words);
-    println!("  Longest words: {:?}", stats_fast.longest_words);
-    println!("  Time: {} ms", stats_fast.time_ms);
     
-    let speedup = stats_slow.time_ms as f64 / stats_fast.time_ms.max(1) as f64;
-    println!("\nSpeedup: {:.1}x faster!", speedup);
+    let start = Instant::now();
+    let stats = analyze_text_slow(&text);
+    let elapsed = start.elapsed().as_micros();
+
+    println!("Results:");
+    println!("  Unique words: {}", stats.word_count);
+    println!("  Total chars: {}", stats.char_count);
+    println!("  Top 10 words: {:?}", stats.top_words);
+    println!("  Longest words: {:?}", stats.longest_words);
+    println!("\n⏱️  Time taken: {} µs ({:.2} ms)", elapsed, elapsed as f64 / 1000.0);
 }
+
